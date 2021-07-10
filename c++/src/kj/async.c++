@@ -276,6 +276,8 @@ public:
       : taskSet(taskSet), node(kj::mv(nodeParam)) {
     node->setSelfPointer(&node);
     node->onReady(this);
+    // TODO(perf): We could potentially apply the immediately-ready promise coroutine optimization
+    //   here, but fire() deletes itself, and I'm not sure it's worth working around it.
   }
 
   Maybe<Own<Task>> next;
@@ -1087,6 +1089,8 @@ Maybe<Own<Event>> XThreadEvent::fire() {
     };
     KJ_IF_MAYBE(n, promiseNode) {
       n->get()->onReady(this);
+      // TODO(perf): Immediately-ready promise coroutine optimization here? We should be able to
+      //   just `if (isNext()) { disarm(); return fire(); }`, right?
     } else {
       return Own<Event>(this, DISPOSER);
     }
@@ -1833,6 +1837,7 @@ void waitImpl(Own<_::PromiseNode>&& node, _::ExceptionOrValue& result, WaitScope
 
     node->setSelfPointer(&node);
     node->onReady(fiber);
+    // TODO(perf): If fiber->isNext(), can we immediately node->get() and avoid a context switch?
 
     fiber->currentInner = node;
     KJ_DEFER(fiber->currentInner = nullptr);
@@ -2040,6 +2045,10 @@ void Event::armLast() {
 
     loop.setRunnable(true);
   }
+}
+
+bool Event::isNext() {
+  return loop.running && loop.head == this;
 }
 
 void Event::disarm() {
@@ -2301,6 +2310,7 @@ ForkHubBase::ForkHubBase(Own<PromiseNode>&& innerParam, ExceptionOrValue& result
     : inner(kj::mv(innerParam)), resultRef(resultRef) {
   inner->setSelfPointer(&inner);
   inner->onReady(this);
+  // TODO(perf): Optimize for coroutines?
 }
 
 Maybe<Own<Event>> ForkHubBase::fire() {
@@ -2342,6 +2352,10 @@ ChainPromiseNode::ChainPromiseNode(Own<PromiseNode> innerParam)
     : state(STEP1), inner(kj::mv(innerParam)) {
   inner->setSelfPointer(&inner);
   inner->onReady(this);
+  // TODO(perf): It'd be nice to implement the immediate-execution optimization here for coroutines'
+  //   benefit, but it's difficult to avoid stack overflows from long chains of onReady() -> fire()
+  //   code paths. It seems like we need to make co_await run a miniature event loop until it would
+  //   block.
 }
 
 ChainPromiseNode::~ChainPromiseNode() noexcept(false) {}
@@ -2457,7 +2471,21 @@ void ChainPromiseNode::traceEvent(TraceBuilder& builder) {
 // -------------------------------------------------------------------
 
 ExclusiveJoinPromiseNode::ExclusiveJoinPromiseNode(Own<PromiseNode> left, Own<PromiseNode> right)
-    : left(*this, kj::mv(left)), right(*this, kj::mv(right)) {}
+    : left(*this, kj::mv(left)), right(*this, kj::mv(right)) {
+  // Optimization: If one of our branches is next in the event loop, we don't need to wait, and can
+  // fire() away. If In this case, the other branch is canceled and a coroutine awaiting the
+  // join-node can execute without suspension.
+  //
+  // We cannot perform this check in Branch's constructor, because fire() requires that both
+  // branches have already been constructed.
+  for (auto branch: { &this->left, &this->right }) {
+    if (branch->isNext()) {
+      branch->disarm();
+      KJ_ASSERT(branch->fire() == nullptr);
+      break;
+    }
+  }
+}
 
 ExclusiveJoinPromiseNode::~ExclusiveJoinPromiseNode() noexcept(false) {}
 
@@ -2488,6 +2516,9 @@ ExclusiveJoinPromiseNode::Branch::Branch(
     : joinNode(joinNode), dependency(kj::mv(dependencyParam)) {
   dependency->setSelfPointer(&dependency);
   dependency->onReady(this);
+  // We don't optimize for immediately-ready promises here, because fire() requires that `joinNode`
+  // has fully constructed both branches. Instead, `ExclusiveJoinPromiseNode`'s constructor performs
+  // the isNext() checks.
 }
 
 ExclusiveJoinPromiseNode::Branch::~Branch() noexcept(false) {}
@@ -2580,6 +2611,13 @@ ArrayJoinPromiseNodeBase::Branch::Branch(
     : joinNode(joinNode), dependency(kj::mv(dependencyParam)), output(output) {
   dependency->setSelfPointer(&dependency);
   dependency->onReady(this);
+  // Optimization: If we're next in the event loop, we don't need to wait, and can fire() away. If
+  // all branches on our join-node fire like this, then a coroutine awaiting the join-node can
+  // execute without suspension.
+  if (isNext()) {
+    disarm();
+    KJ_ASSERT(fire() == nullptr);
+  }
 }
 
 ArrayJoinPromiseNodeBase::Branch::~Branch() noexcept(false) {}
@@ -2629,9 +2667,17 @@ EagerPromiseNodeBase::EagerPromiseNodeBase(
     : dependency(kj::mv(dependencyParam)), resultRef(resultRef) {
   dependency->setSelfPointer(&dependency);
   dependency->onReady(this);
+  // We don't implement the immediate-execution optimization here, because `resultRef` points to
+  // uninitialized memory in our subclass at the moment. Instead, we'll do it in onReady().
 }
 
 void EagerPromiseNodeBase::onReady(Event* event) noexcept {
+  // Optimization: If we're next in the event loop, we don't need to wait, and can fire() away. This
+  // allows coroutines which await an eager promise to execute without suspending.
+  if (isNext()) {
+    disarm();
+    KJ_ASSERT(fire() == nullptr);
+  }
   onReadyEvent.init(event);
 }
 
@@ -2707,4 +2753,202 @@ namespace _ {  // (private)
 Promise<void> IdentityFunc<Promise<void>>::operator()() const { return READY_NOW; }
 
 }  // namespace _ (private)
+
+// -------------------------------------------------------------------
+
+#if KJ_HAS_COROUTINE
+
+namespace _ {  // (private)
+
+CoroutineBase::CoroutineBase(stdcoro::coroutine_handle<> coroutine, ExceptionOrValue& resultRef)
+    : coroutine(coroutine),
+      resultRef(resultRef) {}
+CoroutineBase::~CoroutineBase() noexcept(false) {
+  readMaybe(maybeDisposalResults)->destructorRan = true;
+}
+
+void CoroutineBase::unhandled_exception() {
+  // Pretty self-explanatory, we propagate the exception to the promise which owns us, unless
+  // we're being destroyed, in which case we propagate it back to our disposer. Note that all
+  // unhandled exceptions end up here, not just ones after the first co_await.
+
+  KJ_IF_MAYBE(exception, kj::runCatchingExceptions([] { throw; })) {
+    KJ_IF_MAYBE(disposalResults, maybeDisposalResults) {
+      // Exception during coroutine destruction. Only record the first one.
+      if (disposalResults->exception == nullptr) {
+        disposalResults->exception = kj::mv(*exception);
+      }
+    } else if (isWaiting()) {
+      // Exception during coroutine execution.
+      resultRef.addException(kj::mv(*exception));
+      scheduleResumption();
+    } else {
+      // Okay, what could this mean? We've already been fulfilled or rejected, but we aren't being
+      // destroyed yet. The only possibility is that we are unwinding the coroutine frame due to a
+      // successful completion, and something in the frame threw. We can't already be rejected,
+      // because rejecting a coroutine involves throwing, which would have unwound the frame prior
+      // to setting `waiting = false`.
+      //
+      // Since we know we're unwinding due to a successful completion, we also know that whatever
+      // Event we may have armed has not yet fired, because we haven't had a chance to return to
+      // the event loop.
+
+      // final_suspend() has not been called.
+      KJ_IASSERT(!coroutine.done());
+
+      // Since final_suspend() hasn't been called, whatever Event is waiting on us has not fired,
+      // and will see this exception.
+      resultRef.addException(kj::mv(*exception));
+    }
+  } else {
+    KJ_UNREACHABLE;
+  }
+}
+
+void CoroutineBase::onReady(Event* event) noexcept {
+  onReadyEvent.init(event);
+}
+
+void CoroutineBase::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
+  if (stopAtNextEvent) return;
+
+  KJ_IF_MAYBE(promise, promiseNodeForTrace) {
+    promise->tracePromise(builder, stopAtNextEvent);
+  }
+
+  // Maybe returning the address of coroutine() will give us a function name with meaningful type
+  // information.
+  builder.add(GetFunctorStartAddress<>::apply(coroutine));
+};
+
+Maybe<Own<Event>> CoroutineBase::fire() {
+  // Call Awaiter::await_resume() and proceed with the coroutine. Note that this will not destroy
+  // the coroutine if control flows off the end of it, because we return suspend_always() from
+  // final_suspend().
+  //
+  // It's tempting to arrange to check for exceptions right now and reject the promise that owns
+  // us without resuming the coroutine, which would save us from throwing an exception when we
+  // already know where it's going. But, we don't really know: unlike in the KJ_NO_EXCEPTIONS
+  // case, the `co_await` might be in a try-catch block, so we have no choice but to resume and
+  // throw later.
+  //
+  // TODO(someday): If we ever support coroutines with -fno-exceptions, we'll need to reject the
+  //   enclosing coroutine promise here, if the Awaiter's result is exceptional.
+
+  promiseNodeForTrace = nullptr;
+
+  coroutine.resume();
+
+  return nullptr;
+}
+
+void CoroutineBase::traceEvent(TraceBuilder& builder) {
+  KJ_IF_MAYBE(promise, promiseNodeForTrace) {
+    promise->tracePromise(builder, true);
+  }
+
+  // Maybe returning the address of coroutine() will give us a function name with meaningful type
+  // information.
+  builder.add(GetFunctorStartAddress<>::apply(coroutine));
+
+  onReadyEvent.traceEvent(builder);
+}
+
+void CoroutineBase::disposeImpl(void* pointer) const {
+  KJ_IASSERT(pointer == this);
+
+  // const_cast okay -- every Own<PromiseNode> that we build in get_return_object() uses itself
+  // as the disposer, thus every disposer is unique and there are no thread-safety concerns.
+  const_cast<CoroutineBase&>(*this).destroy();
+}
+
+void CoroutineBase::destroy() {
+  // Mutable helper function for disposeImpl(). Basically a wrapper around coroutine.destroy()
+  // with some stuff to propagate exceptions appropriately.
+
+  // Objects in the coroutine frame might throw from their destructors, so unhandled_exception()
+  // will need some way to communicate those exceptions back to us. Separately, we also want
+  // confirmation that our own ~Coroutine() destructor ran. To solve this, we put a
+  // DisposalResults object on the stack and set a pointer to it in the Coroutine object. This
+  // indicates to unhandled_exception() and ~Coroutine() where to store the results of the
+  // destruction operation.
+  DisposalResults disposalResults;
+  maybeDisposalResults = &disposalResults;
+
+  // Need to save this while `unwindDetector` is still valid.
+  bool shouldRethrow = !unwindDetector.isUnwinding();
+
+  do {
+    // Clang's implementation of the Coroutines TS does not destroy the Coroutine object or
+    // deallocate the coroutine frame if a destructor of an object on the frame threw an
+    // exception. This is despite the fact that it delivered the exception to _us_ via
+    // unhandled_exception(). Anyway, it appears we can work around this by running
+    // coroutine.destroy() a second time.
+    //
+    // On Clang, `disposalResults.exception != nullptr` implies `!disposalResults.destructorRan`.
+    // We could optimize out the separate `destructorRan` flag if we verify that other compilers
+    // behave the same way.
+    coroutine.destroy();
+  } while (!disposalResults.destructorRan);
+
+  // WARNING: `this` is now a dangling pointer.
+
+  KJ_IF_MAYBE(exception, disposalResults.exception) {
+    if (shouldRethrow) {
+      kj::throwFatalException(kj::mv(*exception));
+    } else {
+      // An exception is already unwinding the stack, so throwing this secondary exception would
+      // call std::terminate().
+    }
+  }
+}
+
+CoroutineBase::AwaiterBase::AwaiterBase(Own<PromiseNode> node): node(kj::mv(node)) {}
+CoroutineBase::AwaiterBase::AwaiterBase(AwaiterBase&&) = default;
+CoroutineBase::AwaiterBase::~AwaiterBase() noexcept(false) {
+  // Make sure it's safe to generate an async stack trace between now and when the Coroutine is
+  // destroyed.
+  KJ_IF_MAYBE(coroutineEvent, maybeCoroutineEvent) {
+    coroutineEvent->promiseNodeForTrace = nullptr;
+  }
+
+  unwindDetector.catchExceptionsIfUnwinding([this]() {
+    // No need to check for a moved-from state, node will just ignore the nullification.
+    node = nullptr;
+  });
+}
+
+void CoroutineBase::AwaiterBase::getImpl(ExceptionOrValue& result) {
+  node->get(result);
+
+  KJ_IF_MAYBE(exception, result.exception) {
+    kj::throwFatalException(kj::mv(*exception));
+  }
+}
+
+bool CoroutineBase::AwaiterBase::awaitSuspendImpl(CoroutineBase& coroutineEvent) {
+  node->setSelfPointer(&node);
+  node->onReady(&coroutineEvent);
+
+  if (coroutineEvent.isNext()) {
+    // The result is immediately ready! Let's cancel our event.
+    coroutineEvent.disarm();
+
+    // We can resume ourselves by returning false. This accomplishes the same thing as if we had
+    // returned true from await_ready().
+    return false;
+  } else {
+    // Otherwise, we must suspend. Store a reference to the promise we're waiting on for tracing
+    // purposes; coroutineEvent.fire() and/or ~Adapter() will null this out.
+    coroutineEvent.promiseNodeForTrace = *node;
+    maybeCoroutineEvent = coroutineEvent;
+
+    return true;
+  }
+}
+
+}  // namespace _ (private)
+
+#endif  // KJ_HAS_COROUTINE
+
 }  // namespace kj
